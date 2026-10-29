@@ -1,27 +1,11 @@
 /**
  * AirSim Multirotor PID Target Tracker
- * 
- * Moves the drone to track a locked target using error_x / error_y
- * from OpenCV 4 target recognition.
- *
- * Build (Linux):
- *   g++ -std=c++17 airsim_pid_tracker.cpp \
- *       -I/path/to/AirSim/AirLib/include \
- *       -I/path/to/AirSim/MavLinkCom/include \
- *       -I/path/to/eigen3 \
- *       -L/path/to/AirSim/AirLib/lib \
- *       -lAirLib -lMavLinkCom \
- *       $(pkg-config --cflags --libs opencv4) \
- *       -lpthread -o airsim_pid_tracker
  *
  * Coordinate convention (image → drone body):
  *   error_x > 0  → target is RIGHT  → yaw right  / move right (+Y world)
  *   error_x < 0  → target is LEFT   → yaw left   / move left  (-Y world)
  *   error_y > 0  → target is DOWN   → descend     (-Z world, AirSim NED)
  *   error_y < 0  → target is UP     → ascend      (+Z world, AirSim NED)
- *
- * The drone maintains its forward position (X) while yawing + translating
- * laterally and vertically to center the target in the frame.
  */
 
 #include <iostream>
@@ -41,18 +25,16 @@ STRICT_MODE_OFF
 #include "common/ImageCaptureBase.hpp"
 STRICT_MODE_ON
 
-// OpenCV 4
 #include <opencv2/opencv.hpp>
 
-// ─────────────────────────────────────────────────────────────
-//  PID Controller
-// ─────────────────────────────────────────────────────────────
+#include "AirSimDrone.hpp"
+
 struct PIDController {
     double kp, ki, kd;
-    double integral    = 0.0;
-    double prev_error  = 0.0;
-    double integral_max;          // anti-windup clamp
-    double output_max;            // output saturation
+    double integral   = 0.0;
+    double prev_error = 0.0;
+    double integral_max;
+    double output_max;
 
     PIDController(double kp, double ki, double kd,
                   double integral_max = 5.0,
@@ -63,211 +45,283 @@ struct PIDController {
 
     double update(double error, double dt) {
         if (dt <= 0.0) return 0.0;
-
-        integral  += error * dt;
-        // Anti-windup
-        integral   = std::clamp(integral, -integral_max, integral_max);
-
+        integral = std::clamp(integral + error * dt, -integral_max, integral_max);
         double derivative = (error - prev_error) / dt;
-        prev_error        = error;
-
-        double output = kp * error + ki * integral + kd * derivative;
-        return std::clamp(output, -output_max, output_max);
+        prev_error = error;
+        return std::clamp(kp * error + ki * integral + kd * derivative, -output_max, output_max);
     }
 
-    void reset() {
-        integral   = 0.0;
-        prev_error = 0.0;
-    }
+    void reset() { integral = 0.0; prev_error = 0.0; }
 };
 
-// ─────────────────────────────────────────────────────────────
-//  Config — tune these for your setup
-// ─────────────────────────────────────────────────────────────
 namespace cfg {
-    constexpr int   IMG_W        = 640;
-    constexpr int   IMG_H        = 480;
-
-    // Normalised "dead-zone" — fraction of half-width / half-height
-    // below which we treat error as zero (avoids jitter)
+    constexpr int   IMG_W        = 1280;
+    constexpr int   IMG_H        = 720;
     constexpr float DEAD_ZONE    = 0.02f;
-
-    // Loop rate
     constexpr int   LOOP_HZ      = 30;
-
-    constexpr float CRUISE_ALT   = -2.0f;   // 2 m AGL
-
-    // Velocity limits (m/s)
-    constexpr float VEL_MAX_YAW  = 30.0f;   // deg/s
-    constexpr float VEL_MAX_VERT = 3.0f;    // m/s  (NED Z)
-    constexpr float VEL_MAX_LAT  = 4.0f;    // m/s  (NED Y)
-    constexpr float VEL_MAX_FWD  = 2.0f;    // m/s  (NED X) — slow approach
-
-    // Target lock — pixel threshold to consider "centered"
+    constexpr float CRUISE_ALT   = -2.0f;
+    constexpr float VEL_MAX_YAW  = 30.0f;
+    constexpr float VEL_MAX_VERT = 3.0f;
+    constexpr float VEL_MAX_LAT  = 4.0f;
+    constexpr float VEL_MAX_FWD  = 2.0f;
     constexpr float LOCKED_PX    = 15.0f;
-
-    // AirSim connection
     const std::string AIRSIM_IP  = "127.0.0.1";
+    constexpr int   TARGET_CLASS_ID        = 4;
+    constexpr float CONFIDENCE_THRESHOLD   = 0.45f;
+    constexpr float NMS_THRESHOLD          = 0.4f;
+    constexpr float TIMEOUT_TAKEOFF        = 10.f;
+    constexpr float TIMEOUT_LAND           = 10.f;
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Graceful shutdown
-// ─────────────────────────────────────────────────────────────
+
 std::atomic<bool> g_running{true};
 void sig_handler(int) { g_running = false; }
 
-// ─────────────────────────────────────────────────────────────
-//  Helper: normalise pixel errors to [-1, 1]
-// ─────────────────────────────────────────────────────────────
-inline float normalise_x(float err_px) {
-    return err_px / (cfg::IMG_W * 0.5f);
-}
-inline float normalise_y(float err_px) {
-    return err_px / (cfg::IMG_H * 0.5f);
+
+inline float normalise_x(float err_px) { return err_px / (cfg::IMG_W * 0.5f); }
+inline float normalise_y(float err_px) { return err_px / (cfg::IMG_H * 0.5f); }
+
+inline cv::Rect detectByClassID(cv::dnn::Net& net, const cv::Mat& frame, int class_id)
+{
+    if (frame.empty()) return {};
+
+    cv::Mat blob;
+    cv::dnn::blobFromImage(frame, blob, 1/255.0, cv::Size(640, 640), cv::Scalar(0,0,0), true, false);
+    net.setInput(blob);
+
+    std::vector<cv::Mat> outputs;
+    net.forward(outputs, net.getUnconnectedOutLayersNames());
+
+    cv::Mat output = outputs[0];
+    output = output.reshape(1, 84);
+    cv::transpose(output, output);
+
+    std::vector<cv::Rect>  boxes;
+    std::vector<float>     confidences;
+
+    for (int i = 0; i < output.rows; ++i) {
+        cv::Mat row    = output.row(i);
+        cv::Mat scores = row.colRange(4, 84);
+        cv::Point best;
+        double score;
+        cv::minMaxLoc(scores, nullptr, &score, nullptr, &best);
+
+        if (score > cfg::CONFIDENCE_THRESHOLD && best.x == class_id) {
+            float cx = row.at<float>(0), cy = row.at<float>(1);
+            float w  = row.at<float>(2), h  = row.at<float>(3);
+            int left   = static_cast<int>((cx - 0.5f * w) * (frame.cols / 640.0));
+            int top    = static_cast<int>((cy - 0.5f * h) * (frame.rows / 640.0));
+            int width  = static_cast<int>(w * (frame.cols / 640.0));
+            int height = static_cast<int>(h * (frame.rows / 640.0));
+            boxes.push_back({left, top, width, height});
+            confidences.push_back(static_cast<float>(score));
+        }
+    }
+
+    std::vector<int> indices;
+    cv::dnn::NMSBoxes(boxes, confidences, cfg::CONFIDENCE_THRESHOLD, cfg::NMS_THRESHOLD, indices);
+    return (!indices.empty() && !boxes.empty()) ? boxes[indices[0]] : cv::Rect();
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Main
-// ─────────────────────────────────────────────────────────────
+
 int main()
 {
     std::signal(SIGINT,  sig_handler);
     std::signal(SIGTERM, sig_handler);
 
-    // ── Connect to AirSim ──────────────────────────────────────
     msr::airlib::MultirotorRpcLibClient client(cfg::AIRSIM_IP);
-    client.confirmConnection();
-    client.enableApiControl(true, "Interceptor");
-    client.armDisarm(true, "Interceptor");
 
-    std::cout << "[INFO] Arming & taking off...\n";
-    client.takeoffAsync(10.0f)->waitOnLastTask();
+    try {
+        client.confirmConnection();
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] confirmConnection: " << e.what() << "\n";
+        return 1;
+    }
 
-    // Move to cruise altitude before tracking starts
-    auto pose = client.simGetVehiclePose();
-    client.moveToPositionAsync(
-        pose.position.x(), pose.position.y(), cfg::CRUISE_ALT,
-        2.0f)->waitOnLastTask();
+    AirSimDrone interceptorDrone(client, "Interceptor");
+    AirSimDrone targetDrone(client, "TargetDrone");
 
-    std::cout << "[INFO] Cruising at " << -cfg::CRUISE_ALT << " m AGL\n";
+    try {
+        interceptorDrone.Setup();
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] Interceptor Setup: " << e.what() << "\n";
+        return 1;
+    }
+
+    try {
+        targetDrone.Setup();
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] TargetDrone Setup: " << e.what() << "\n";
+        return 1;
+    }
+
+    try {
+        interceptorDrone.Takeoff(cfg::TIMEOUT_TAKEOFF, true);
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] Interceptor Takeoff: " << e.what() << "\n";
+        return 1;
+    }
+
+    try {
+        targetDrone.Takeoff(cfg::TIMEOUT_TAKEOFF, true);
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] TargetDrone Takeoff: " << e.what() << "\n";
+        return 1;
+    }
+
+    std::vector<msr::airlib::Vector3r> path_loop = {
+        {30.0f,  0.0f, -20.0f},
+        {30.0f, 30.0f, -20.0f},
+        { 0.0f, 30.0f, -20.0f},
+        { 0.0f,  0.0f, -20.0f}
+    };
+
+    //interceptorDrone.MoveToPosition(0, 0, -20.f, 6.f, true);
+
+    std::cout << "[INFO] Loading trained model...\n";
+    cv::dnn::Net net = cv::dnn::readNetFromONNX("yolo11n/yolo11n.onnx");
+    net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+
     std::cout << "[INFO] Starting target tracking loop. Ctrl-C to stop.\n";
 
-    // ── PID controllers ───────────────────────────────────────
-    //   Lateral (Y)  : driven by normalised error_x
-    //   Vertical (Z) : driven by normalised error_y
-    //   Yaw          : driven by normalised error_x (softer gain)
-    PIDController pid_lateral (2.5, 0.05, 0.4,  4.0, cfg::VEL_MAX_LAT);
-    PIDController pid_vertical(2.0, 0.04, 0.35, 4.0, cfg::VEL_MAX_VERT);
-    PIDController pid_yaw     (18.0,0.2,  2.0,  20.0, cfg::VEL_MAX_YAW);
+    auto target_behaviour = [&path_loop](AirSimDrone& self) {
+        try {
+            std::cout << "[" << self.GetName() << "] Flying waypoint loop sequence...\n";
+            self.MoveOnPath(path_loop, 6.0f, true);
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] " << self.GetName() << " MoveOnPath: " << e.what() << "\n";
+            g_running = false;
+        }
+    };
 
-    // ── Timing ────────────────────────────────────────────────
     const double dt_target = 1.0 / cfg::LOOP_HZ;
-    auto t_prev = std::chrono::steady_clock::now();
 
-
-
-    // ── Tracking loop ─────────────────────────────────────────
-    while (g_running) {
+    auto interceptor_behaviour = [
+        &client, &net,
+        pid_lateral  = PIDController{2.5,  0.05, 0.4,   4.0, cfg::VEL_MAX_LAT},
+        pid_vertical = PIDController{2.0,  0.04, 0.35,  4.0, cfg::VEL_MAX_VERT},
+        pid_yaw      = PIDController{18.0, 0.2,  2.0,  20.0, cfg::VEL_MAX_YAW},
+        dt_target,
+        t_prev    = std::chrono::steady_clock::now(),
+        last_seek = std::chrono::steady_clock::now(),
+        seek_right = true
+    ](AirSimDrone& self) mutable
+    {
         auto t_now = std::chrono::steady_clock::now();
         double dt  = std::chrono::duration<double>(t_now - t_prev).count();
         t_prev     = t_now;
-        
+
         const std::vector<msr::airlib::ImageCaptureBase::ImageRequest> request = {
-            msr::airlib::ImageCaptureBase::ImageRequest("front_center", msr::airlib::ImageCaptureBase::ImageType::Scene, false, false)
+            msr::airlib::ImageCaptureBase::ImageRequest(
+                "front_center",
+                msr::airlib::ImageCaptureBase::ImageType::Scene,
+                false, false)
         };
-        const std::vector<msr::airlib::ImageCaptureBase::ImageResponse> response = client.simGetImages(request);
-
-        if (response.empty()) continue;
-        cv::Mat frame(response[0].height, response[0].width, CV_8UC3, (void*)response[0].image_data_uint8.data());
-        cv::Mat hsv, mask, mask1, mask2;
-
-        cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
-
-        cv::inRange(hsv, cv::Scalar(0, 100, 100), cv::Scalar(10, 255, 255), mask1);
-        cv::inRange(hsv, cv::Scalar(160, 100, 100), cv::Scalar(180, 255, 255), mask2);
-
-        mask = mask1 | mask2;
-
-        cv::Moments m = cv::moments(mask, true);
-
-        double error_x = 0.0;
-        double error_y = 0.0;
-        double cx = 0.0;
-        double cy = 0.0;
-
-        if (m.m00 > 0.0) {
-            cx = m.m10 / m.m00;
-            cy = m.m01 / m.m00;
-                
-            cv::circle(frame, cv::Point(cx, cy), 10, cv::Scalar(0, 255, 0), 2);
-            error_x = cx - 320;
-            error_y = cy - 240;
-        } else {
-            cv::imshow("Interceptor", frame);
-            cv::waitKey(1);
-            continue;
+        std::vector<msr::airlib::ImageCaptureBase::ImageResponse> response;
+        try {
+            response = client.simGetImages(request);
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] simGetImages: " << e.what() << "\n";
+            g_running = false;
+            return;
         }
+        if (response.empty()) return;
 
-        // ── ② Apply dead-zone ─────────────────────────────────
-        float normalized_error_x = normalise_x(error_x);
-        float normalized_error_y = normalise_y(error_y);
-        if (std::abs(normalized_error_x) < cfg::DEAD_ZONE) { normalized_error_x = 0.0f; pid_lateral.reset(); pid_yaw.reset(); }
-        if (std::abs(normalized_error_y) < cfg::DEAD_ZONE) { normalized_error_y = 0.0f; pid_vertical.reset(); }
+        cv::Mat frame(response[0].height, response[0].width,
+                      CV_8UC3, (void*)response[0].image_data_uint8.data());
 
-        // ── ③ Compute PID outputs ─────────────────────────────
-        //  Lateral velocity  (NED Y, m/s)
-        float vel_y   = static_cast<float>(pid_lateral .update( normalized_error_x, dt));
-        //  Vertical velocity (NED Z, m/s)  — error_y>0 means descend → +Z in NED
-        float vel_z   = static_cast<float>(pid_vertical.update( normalized_error_y, dt));
-        //  Yaw rate          (deg/s)        — error_x>0 means yaw right
-        float yaw_rate= static_cast<float>(pid_yaw     .update( normalized_error_x, dt * 2.0));
+        cv::Rect box = detectByClassID(net, frame, cfg::TARGET_CLASS_ID);
 
-        // Slow forward approach (optional — comment out if hovering in place)
-        float vel_x   = cfg::VEL_MAX_FWD * 10.f;   // constant creep forward
+        // if (box.empty()) {
+        //     auto now = std::chrono::steady_clock::now();
+        //     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_seek).count() >= 5) {
+        //         float yaw = seek_right ? 90.0f : -90.0f;
+        //         std::cout << "[" << self.GetName() << "] No target — seeking, rotating to " << yaw << "°\n";
+        //         try {
+        //             self.RotateToYaw(5.0f, yaw, true);
+        //         } catch (const std::exception& e) {
+        //             std::cerr << "[ERROR] RotateToYaw: " << e.what() << "\n";
+        //             g_running = false;
+        //             return;
+        //         }
+        //         seek_right = !seek_right;
+        //         last_seek  = std::chrono::steady_clock::now();
+        //     }
+        //     cv::imshow("Interceptor", frame);
+        //     cv::waitKey(1);
+        //     return;
+        // }
 
-        // ── ④ Clamp & send velocity command ───────────────────
-        vel_x = std::clamp(vel_x, -cfg::VEL_MAX_FWD,  cfg::VEL_MAX_FWD);
+        double cx = box.x + box.width  / 2.0;
+        double cy = box.y + box.height / 2.0;
+        double error_x = cx - frame.cols / 2.0;
+        double error_y = cy - frame.rows / 2.0;
+
+        float norm_x = normalise_x(static_cast<float>(error_x));
+        float norm_y = normalise_y(static_cast<float>(error_y));
+        if (std::abs(norm_x) < cfg::DEAD_ZONE) { norm_x = 0.0f; pid_lateral.reset(); pid_yaw.reset(); }
+        if (std::abs(norm_y) < cfg::DEAD_ZONE) { norm_y = 0.0f; pid_vertical.reset(); }
+
+        float vel_y    = static_cast<float>(pid_lateral .update(norm_x, dt));
+        float vel_z    = static_cast<float>(pid_vertical.update(norm_y, dt));
+        float yaw_rate = static_cast<float>(pid_yaw     .update(norm_x, dt * 2.0));
+        float vel_x    = std::clamp(cfg::VEL_MAX_FWD * 10.f, -cfg::VEL_MAX_FWD, cfg::VEL_MAX_FWD);
         vel_y = std::clamp(vel_y, -cfg::VEL_MAX_LAT,  cfg::VEL_MAX_LAT);
         vel_z = std::clamp(vel_z, -cfg::VEL_MAX_VERT, cfg::VEL_MAX_VERT);
 
-        // YawMode: is_rate=true means we pass yaw_rate (deg/s)
-        client.moveByVelocityBodyFrameAsync(
-            vel_x, vel_y, vel_z,
-            static_cast<float>(dt_target * 2.0),   // command duration
-            msr::airlib::DrivetrainType::MaxDegreeOfFreedom,
-            msr::airlib::YawMode(true, yaw_rate)
-        );
+        try {
+            self.MoveByVelocityBodyFrame(vel_x, vel_y, vel_z,
+                                         static_cast<float>(dt_target * 2.0), yaw_rate);
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] MoveByVelocityBodyFrame: " << e.what() << "\n";
+            g_running = false;
+            return;
+        }
 
-        // ── ⑤ Debug output ────────────────────────────────────
-        bool locked = (std::abs(error_x) < cfg::LOCKED_PX &&
-                       std::abs(error_y) < cfg::LOCKED_PX);
-
-        std::printf("\n[%s] err=(%+6.1f, %+6.1f)px  vel=(%+.2f, %+.2f, %+.2f)m/s  yaw=%+.1f°/s   ",
+        bool locked = std::abs(error_x) < cfg::LOCKED_PX && std::abs(error_y) < cfg::LOCKED_PX;
+        std::printf("\n[%s] err=(%+6.1f,%+6.1f)px  vel=(%+.2f,%+.2f,%+.2f)m/s  yaw=%+.1f°/s",
                     locked ? "LOCKED " : "TRACKING",
-                    error_x, error_y,
-                    vel_x, vel_y, vel_z,
-                    yaw_rate);
-        
-        std::string status = "LOCK: [" + std::to_string(error_x) + ", " + std::to_string(error_y) + "]";
-        cv::putText(frame, status,cv::Point(static_cast<int>(cx) + 20, static_cast<int>(cy) - 20),cv::FONT_HERSHEY_SIMPLEX, 0.5f, cv::Scalar(255, 0, 0));
+                    error_x, error_y, vel_x, vel_y, vel_z, yaw_rate);
+
+        cv::circle(frame, cv::Point(static_cast<int>(cx), static_cast<int>(cy)),
+                   10, cv::Scalar(0, 255, 0), 2);
+        cv::putText(frame,
+                    "LOCK: [" + std::to_string(error_x) + ", " + std::to_string(error_y) + "]",
+                    cv::Point(static_cast<int>(cx) + 20, static_cast<int>(cy) - 20),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5f, cv::Scalar(255, 0, 0));
         cv::imshow("Interceptor", frame);
         cv::waitKey(1);
-        //std::fflush(stdout);
 
-        // ── ⑥ Sleep to maintain loop rate ─────────────────────
-        auto elapsed = std::chrono::steady_clock::now() - t_now;
-        auto sleep_us = std::chrono::microseconds(
-            static_cast<long>(dt_target * 1e6)) - elapsed;
-        if (sleep_us.count() > 0)
-            std::this_thread::sleep_for(sleep_us);
+        auto elapsed  = std::chrono::steady_clock::now() - t_now;
+        auto sleep_us = std::chrono::microseconds(static_cast<long>(dt_target * 1e6)) - elapsed;
+        if (sleep_us.count() > 0) std::this_thread::sleep_for(sleep_us);
+    };
+
+    // ── Threads ───────────────────────────────────────────────
+
+    std::thread target_thread([&]() {
+        while (g_running) targetDrone.Update(target_behaviour);
+    });
+
+    while (g_running) {
+        interceptorDrone.Update(interceptor_behaviour);
     }
 
-    // ── Graceful shutdown ─────────────────────────────────────
-    std::cout << "\n[INFO] Shutting down — hovering in place...\n";
-    client.hoverAsync()->waitOnLastTask();
-    client.landAsync(5.0f)->waitOnLastTask();
-    client.armDisarm(false);
-    client.enableApiControl(false);
+    std::cout << "\n[INFO] Shutting down...\n";
+    target_thread.join();
+
+    try { interceptorDrone.Land(cfg::TIMEOUT_LAND, true); } catch (const std::exception& e) { std::cerr << "[ERROR] Interceptor Land: " << e.what() << "\n"; }
+    try { targetDrone.Land(cfg::TIMEOUT_LAND, true);      } catch (const std::exception& e) { std::cerr << "[ERROR] TargetDrone Land: "  << e.what() << "\n"; }
+
+    try {
+        client.armDisarm(false, "Interceptor");
+        client.armDisarm(false, "TargetDrone");
+        client.enableApiControl(false, "Interceptor");
+        client.enableApiControl(false, "TargetDrone");
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] Disarm/disable: " << e.what() << "\n";
+    }
 
     return 0;
 }

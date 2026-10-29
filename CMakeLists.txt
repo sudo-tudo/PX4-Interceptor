@@ -39,3 +39,11 @@ target_include_directories(interceptor_vision PRIVATE ${AIRLIB_INCLUDE_DIRS})
 target_link_libraries(interceptor_vision PRIVATE ${OpenCV_LIBS} ${AIRLIB_LIBRARIES} Threads::Threads)
 target_compile_options(interceptor_vision PRIVATE "$<$<PLATFORM_ID:Linux>:-stdlib=libc++>")
 target_link_options(interceptor_vision PRIVATE "$<$<PLATFORM_ID:Linux>:-stdlib=libc++>")
+
+add_custom_target(copy_models ALL
+    COMMAND ${CMAKE_COMMAND} -E create_symlink 
+    ${CMAKE_CURRENT_SOURCE_DIR}/yolo11n 
+    ${CMAKE_CURRENT_BINARY_DIR}/yolo11n
+    COMMENT "Creating symlink for YOLO models in build directory"
+)
+add_dependencies(interceptor_vision copy_models)
