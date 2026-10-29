@@ -34,3 +34,7 @@
 !.vscode/settings.json
 .clangd
 .venv/
+
+*.lib
+*.pdb
+*.idb
