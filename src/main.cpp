@@ -95,7 +95,7 @@ namespace cfg {
     // Loop rate
     constexpr int   LOOP_HZ      = 30;
 
-    constexpr float CRUISE_ALT   = -1.0f;   // 1 m AGL
+    constexpr float CRUISE_ALT   = -2.0f;   // 2 m AGL
 
     // Velocity limits (m/s)
     constexpr float VEL_MAX_YAW  = 30.0f;   // deg/s
@@ -183,8 +183,8 @@ int main()
 
         cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
 
-        cv::inRange(hsv, cv::Scalar(0, 120, 70), cv::Scalar(10, 255, 255), mask1);
-        cv::inRange(hsv, cv::Scalar(170, 120, 70), cv::Scalar(180, 255, 255), mask2);
+        cv::inRange(hsv, cv::Scalar(0, 100, 100), cv::Scalar(10, 255, 255), mask1);
+        cv::inRange(hsv, cv::Scalar(160, 100, 100), cv::Scalar(180, 255, 255), mask2);
 
         mask = mask1 | mask2;
 
@@ -195,40 +195,35 @@ int main()
         double cx = 0.0;
         double cy = 0.0;
 
-        if (m.m00 >= 100.0) {
+        if (m.m00 > 0.0) {
             cx = m.m10 / m.m00;
             cy = m.m01 / m.m00;
                 
-            cv::drawMarker(frame, cv::Point(cx, cy), cv::Scalar(0, 255, 0), cv::MARKER_SQUARE, 30, 2);
+            cv::circle(frame, cv::Point(cx, cy), 10, cv::Scalar(0, 255, 0), 2);
             error_x = cx - 320;
             error_y = cy - 240;
         } else {
-            // Lost target — hover in place
-            client.hoverAsync();
-            pid_lateral .reset();
-            pid_vertical.reset();
-            pid_yaw     .reset();
-            // std::this_thread::sleep_for(
-            //     std::chrono::milliseconds(static_cast<int>(dt_target * 1000)));
-            // continue;
+            cv::imshow("Interceptor", frame);
+            cv::waitKey(1);
+            continue;
         }
 
         // ── ② Apply dead-zone ─────────────────────────────────
-        float nx = normalise_x(error_x);
-        float ny = normalise_y(error_y);
-        if (std::abs(nx) < cfg::DEAD_ZONE) { nx = 0.0f; pid_lateral.reset(); pid_yaw.reset(); }
-        if (std::abs(ny) < cfg::DEAD_ZONE) { ny = 0.0f; pid_vertical.reset(); }
+        float normalized_error_x = normalise_x(error_x);
+        float normalized_error_y = normalise_y(error_y);
+        if (std::abs(normalized_error_x) < cfg::DEAD_ZONE) { normalized_error_x = 0.0f; pid_lateral.reset(); pid_yaw.reset(); }
+        if (std::abs(normalized_error_y) < cfg::DEAD_ZONE) { normalized_error_y = 0.0f; pid_vertical.reset(); }
 
         // ── ③ Compute PID outputs ─────────────────────────────
         //  Lateral velocity  (NED Y, m/s)
-        float vel_y   = static_cast<float>(pid_lateral .update( nx, dt));
+        float vel_y   = static_cast<float>(pid_lateral .update( normalized_error_x, dt));
         //  Vertical velocity (NED Z, m/s)  — error_y>0 means descend → +Z in NED
-        float vel_z   = static_cast<float>(pid_vertical.update( ny, dt));
+        float vel_z   = static_cast<float>(pid_vertical.update( normalized_error_y, dt));
         //  Yaw rate          (deg/s)        — error_x>0 means yaw right
-        float yaw_rate= static_cast<float>(pid_yaw     .update( nx, dt));
+        float yaw_rate= static_cast<float>(pid_yaw     .update( normalized_error_x, dt * 2.0));
 
         // Slow forward approach (optional — comment out if hovering in place)
-        float vel_x   = cfg::VEL_MAX_FWD * 0.3f;   // constant creep forward
+        float vel_x   = cfg::VEL_MAX_FWD * 10.f;   // constant creep forward
 
         // ── ④ Clamp & send velocity command ───────────────────
         vel_x = std::clamp(vel_x, -cfg::VEL_MAX_FWD,  cfg::VEL_MAX_FWD);
@@ -238,7 +233,7 @@ int main()
         // moveByVelocityAsync(vx, vy, vz, duration, drivetrainType, yawMode)
         // YawMode: is_rate=true means we pass yaw_rate (deg/s)
         client.moveByVelocityAsync(
-            vel_x, vel_y, vel_z,
+            -vel_x, vel_y, vel_z,
             static_cast<float>(dt_target * 2.0),   // command duration
             msr::airlib::DrivetrainType::MaxDegreeOfFreedom,
             msr::airlib::YawMode(true, yaw_rate)
@@ -248,17 +243,17 @@ int main()
         bool locked = (std::abs(error_x) < cfg::LOCKED_PX &&
                        std::abs(error_y) < cfg::LOCKED_PX);
 
-        std::printf("\r[%s] err=(%+6.1f, %+6.1f)px  vel=(%+.2f, %+.2f, %+.2f)m/s  yaw=%+.1f°/s   ",
+        std::printf("\n[%s] err=(%+6.1f, %+6.1f)px  vel=(%+.2f, %+.2f, %+.2f)m/s  yaw=%+.1f°/s   ",
                     locked ? "LOCKED " : "TRACKING",
                     error_x, error_y,
                     vel_x, vel_y, vel_z,
                     yaw_rate);
         
         std::string status = "LOCK: [" + std::to_string(error_x) + ", " + std::to_string(error_y) + "]";
-        cv::putText(frame, status,cv::Point(static_cast<int>(cx) + 20, static_cast<int>(cy) - 20),cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255, 0, 0));
+        cv::putText(frame, status,cv::Point(static_cast<int>(cx) + 20, static_cast<int>(cy) - 20),cv::FONT_HERSHEY_SIMPLEX, 0.5f, cv::Scalar(255, 0, 0));
         cv::imshow("Interceptor", frame);
         cv::waitKey(1);
-        std::fflush(stdout);
+        //std::fflush(stdout);
 
         // ── ⑥ Sleep to maintain loop rate ─────────────────────
         auto elapsed = std::chrono::steady_clock::now() - t_now;
