@@ -1,0 +1,35 @@
+# CMake build directories
+/build*/
+/cmake-build-*/
+
+# CMake generated files
+/CMakeCache.txt
+/CMakeFiles/
+/Makefile
+/cmake_install.cmake
+/compile_commands.json
+/CTestTestfile.cmake
+/Testing/
+/install_manifest.txt
+/CMakeUserPresets.json
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+
+# Editor and OS noise
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Keep shared VS Code settings, ignore the rest
+.vscode/*
+!.vscode/settings.json
+.clangd
