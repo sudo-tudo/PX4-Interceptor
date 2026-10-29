@@ -1,5 +1,13 @@
 {
-  "cmake.useCMakePresets": "always",
-  "cmake.configureOnOpen": true,
-  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json"
+  "cmake.configureOnOpen": false,
+  "C_Cpp.default.compilerPath": "/usr/bin/clang++",
+  "C_Cpp.default.cppStandard": "c++17",
+  "C_Cpp.default.includePath": [
+    "${workspaceFolder}/src",
+    "${workspaceFolder}/AirLib/include",
+    "${workspaceFolder}/AirLib/deps/rpclib/include",
+    "${workspaceFolder}/AirLib/deps/MavLinkCom/include",
+    "${workspaceFolder}/AirLib/deps/eigen3",
+    "/home/kira/opencv-libc++/include/opencv4"
+  ]
 }

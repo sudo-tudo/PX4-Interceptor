@@ -1,0 +1,10 @@
+E:\CodexLabs\Colosseum\AirLib\src\api\RpcLibClientBase.cpp;E:\CodexLabs\Colosseum\AirLib\temp\AirLib\x64\RelWithDebInfo\RpcLibClientBase.obj
+E:\CodexLabs\Colosseum\AirLib\src\api\RpcLibServerBase.cpp;E:\CodexLabs\Colosseum\AirLib\temp\AirLib\x64\RelWithDebInfo\RpcLibServerBase.obj
+E:\CodexLabs\Colosseum\AirLib\src\vehicles\multirotor\api\MultirotorApiBase.cpp;E:\CodexLabs\Colosseum\AirLib\temp\AirLib\x64\RelWithDebInfo\MultirotorApiBase.obj
+E:\CodexLabs\Colosseum\AirLib\src\safety\ObstacleMap.cpp;E:\CodexLabs\Colosseum\AirLib\temp\AirLib\x64\RelWithDebInfo\ObstacleMap.obj
+E:\CodexLabs\Colosseum\AirLib\src\safety\SafetyEval.cpp;E:\CodexLabs\Colosseum\AirLib\temp\AirLib\x64\RelWithDebInfo\SafetyEval.obj
+E:\CodexLabs\Colosseum\AirLib\src\common\common_utils\FileSystem.cpp;E:\CodexLabs\Colosseum\AirLib\temp\AirLib\x64\RelWithDebInfo\FileSystem.obj
+E:\CodexLabs\Colosseum\AirLib\src\vehicles\car\api\CarRpcLibClient.cpp;E:\CodexLabs\Colosseum\AirLib\temp\AirLib\x64\RelWithDebInfo\CarRpcLibClient.obj
+E:\CodexLabs\Colosseum\AirLib\src\vehicles\car\api\CarRpcLibServer.cpp;E:\CodexLabs\Colosseum\AirLib\temp\AirLib\x64\RelWithDebInfo\CarRpcLibServer.obj
+E:\CodexLabs\Colosseum\AirLib\src\vehicles\multirotor\api\MultirotorRpcLibClient.cpp;E:\CodexLabs\Colosseum\AirLib\temp\AirLib\x64\RelWithDebInfo\MultirotorRpcLibClient.obj
+E:\CodexLabs\Colosseum\AirLib\src\vehicles\multirotor\api\MultirotorRpcLibServer.cpp;E:\CodexLabs\Colosseum\AirLib\temp\AirLib\x64\RelWithDebInfo\MultirotorRpcLibServer.obj
