@@ -230,10 +230,9 @@ int main()
         vel_y = std::clamp(vel_y, -cfg::VEL_MAX_LAT,  cfg::VEL_MAX_LAT);
         vel_z = std::clamp(vel_z, -cfg::VEL_MAX_VERT, cfg::VEL_MAX_VERT);
 
-        // moveByVelocityAsync(vx, vy, vz, duration, drivetrainType, yawMode)
         // YawMode: is_rate=true means we pass yaw_rate (deg/s)
-        client.moveByVelocityAsync(
-            -vel_x, vel_y, vel_z,
+        client.moveByVelocityBodyFrameAsync(
+            vel_x, vel_y, vel_z,
             static_cast<float>(dt_target * 2.0),   // command duration
             msr::airlib::DrivetrainType::MaxDegreeOfFreedom,
             msr::airlib::YawMode(true, yaw_rate)
