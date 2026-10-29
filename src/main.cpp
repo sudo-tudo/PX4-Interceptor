@@ -139,19 +139,11 @@ int main()
     }
 
     AirSimDrone interceptorDrone(client, "Interceptor");
-    AirSimDrone targetDrone(client, "TargetDrone");
 
     try {
         interceptorDrone.Setup();
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] Interceptor Setup: " << e.what() << "\n";
-        return 1;
-    }
-
-    try {
-        targetDrone.Setup();
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] TargetDrone Setup: " << e.what() << "\n";
         return 1;
     }
 
@@ -162,20 +154,6 @@ int main()
         return 1;
     }
 
-    try {
-        targetDrone.Takeoff(cfg::TIMEOUT_TAKEOFF, true);
-    } catch (const std::exception& e) {
-        std::cerr << "[ERROR] TargetDrone Takeoff: " << e.what() << "\n";
-        return 1;
-    }
-
-    std::vector<msr::airlib::Vector3r> path_loop = {
-        {30.0f,  0.0f, -20.0f},
-        {30.0f, 30.0f, -20.0f},
-        { 0.0f, 30.0f, -20.0f},
-        { 0.0f,  0.0f, -20.0f}
-    };
-
     //interceptorDrone.MoveToPosition(0, 0, -20.f, 6.f, true);
 
     std::cout << "[INFO] Loading trained model...\n";
@@ -185,16 +163,6 @@ int main()
 
     std::cout << "[INFO] Starting target tracking loop. Ctrl-C to stop.\n";
 
-    auto target_behaviour = [&path_loop](AirSimDrone& self) {
-        try {
-            std::cout << "[" << self.GetName() << "] Flying waypoint loop sequence...\n";
-            self.MoveOnPath(path_loop, 6.0f, true);
-        } catch (const std::exception& e) {
-            std::cerr << "[ERROR] " << self.GetName() << " MoveOnPath: " << e.what() << "\n";
-            g_running = false;
-        }
-    };
-
     const double dt_target = 1.0 / cfg::LOOP_HZ;
 
     auto interceptor_behaviour = [
@@ -203,9 +171,12 @@ int main()
         pid_vertical = PIDController{2.0,  0.04, 0.35,  4.0, cfg::VEL_MAX_VERT},
         pid_yaw      = PIDController{18.0, 0.2,  2.0,  20.0, cfg::VEL_MAX_YAW},
         dt_target,
-        t_prev    = std::chrono::steady_clock::now(),
-        last_seek = std::chrono::steady_clock::now(),
-        seek_right = true
+        t_prev          = std::chrono::steady_clock::now(),
+        last_seek       = std::chrono::steady_clock::now(),
+        seek_right      = true,
+        last_cx         = 0.0,
+        last_cy         = 0.0,
+        target_acquired = false
     ](AirSimDrone& self) mutable
     {
         auto t_now = std::chrono::steady_clock::now();
@@ -233,28 +204,18 @@ int main()
 
         cv::Rect box = detectByClassID(net, frame, cfg::TARGET_CLASS_ID);
 
-        // if (box.empty()) {
-        //     auto now = std::chrono::steady_clock::now();
-        //     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_seek).count() >= 5) {
-        //         float yaw = seek_right ? 90.0f : -90.0f;
-        //         std::cout << "[" << self.GetName() << "] No target — seeking, rotating to " << yaw << "°\n";
-        //         try {
-        //             self.RotateToYaw(5.0f, yaw, true);
-        //         } catch (const std::exception& e) {
-        //             std::cerr << "[ERROR] RotateToYaw: " << e.what() << "\n";
-        //             g_running = false;
-        //             return;
-        //         }
-        //         seek_right = !seek_right;
-        //         last_seek  = std::chrono::steady_clock::now();
-        //     }
-        //     cv::imshow("Interceptor", frame);
-        //     cv::waitKey(1);
-        //     return;
-        // }
+        if (!box.empty()) {
+            last_cx         = box.x + box.width  / 2.0;
+            last_cy         = box.y + box.height / 2.0;
+            target_acquired = true;
+        } else if (!target_acquired) {
+            cv::imshow("Interceptor", frame);
+            cv::waitKey(1);
+            return;
+        }
 
-        double cx = box.x + box.width  / 2.0;
-        double cy = box.y + box.height / 2.0;
+        double cx = last_cx;
+        double cy = last_cy;
         double error_x = cx - frame.cols / 2.0;
         double error_y = cy - frame.rows / 2.0;
 
@@ -280,8 +241,9 @@ int main()
         }
 
         bool locked = std::abs(error_x) < cfg::LOCKED_PX && std::abs(error_y) < cfg::LOCKED_PX;
+        const char* state = !box.empty() ? (locked ? "LOCKED  " : "TRACKING") : "LAST POS";
         std::printf("\n[%s] err=(%+6.1f,%+6.1f)px  vel=(%+.2f,%+.2f,%+.2f)m/s  yaw=%+.1f°/s",
-                    locked ? "LOCKED " : "TRACKING",
+                    state,
                     error_x, error_y, vel_x, vel_y, vel_z, yaw_rate);
 
         cv::circle(frame, cv::Point(static_cast<int>(cx), static_cast<int>(cy)),
@@ -298,27 +260,17 @@ int main()
         if (sleep_us.count() > 0) std::this_thread::sleep_for(sleep_us);
     };
 
-    // ── Threads ───────────────────────────────────────────────
-
-    std::thread target_thread([&]() {
-        while (g_running) targetDrone.Update(target_behaviour);
-    });
-
     while (g_running) {
         interceptorDrone.Update(interceptor_behaviour);
     }
 
     std::cout << "\n[INFO] Shutting down...\n";
-    target_thread.join();
 
     try { interceptorDrone.Land(cfg::TIMEOUT_LAND, true); } catch (const std::exception& e) { std::cerr << "[ERROR] Interceptor Land: " << e.what() << "\n"; }
-    try { targetDrone.Land(cfg::TIMEOUT_LAND, true);      } catch (const std::exception& e) { std::cerr << "[ERROR] TargetDrone Land: "  << e.what() << "\n"; }
 
     try {
         client.armDisarm(false, "Interceptor");
-        client.armDisarm(false, "TargetDrone");
         client.enableApiControl(false, "Interceptor");
-        client.enableApiControl(false, "TargetDrone");
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] Disarm/disable: " << e.what() << "\n";
     }
